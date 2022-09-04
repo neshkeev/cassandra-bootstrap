@@ -1,0 +1,145 @@
+#!/bin/bash
+
+VERSION=${1:-4.0.6}
+
+function check_exists() {
+	local version="${1:-${VERSION}}"
+	local dist="${2:-cassandra-${version}.tar.gz}"
+
+	[ -f "${dist}" ]
+}
+
+function download() {
+	local version="${1:-${VERSION}}"
+	local dist="${2:-cassandra-${version}.tar.gz}"
+
+	local url="https://dlcdn.apache.org/cassandra/${VERSION}/apache-cassandra-${VERSION}-bin.tar.gz"
+
+	curl -Lo "${dist}" "${url}"
+}
+
+function extract() {
+	local target_dir="${1}"
+	local filename="${2:-cassandra-${VERSION}.tar.gz}"
+
+	[ -d "${target_dir}" ] && {
+		return 0
+	}
+
+	[ -f "$filename" ] || {
+		echo "No ${filename} archive found" >&2
+		return 1
+	}
+
+	# FIXME check tar transform
+	tar -xf "${filename}" --transform "s/apache-cassandra-4.0.6/${target_dir}/"
+}
+
+function change_yaml_value() {
+	local filename="${1}"
+	local key="${2}"
+	local new_value="${3}"
+
+	[ -f "$filename" ] || {
+		echo "Unable to open '${filename}'" >&2
+		return 1
+	}
+
+	[ -n "$key" ] || {
+		echo "Key cannot be empty" >&2
+		return 1
+	}
+
+	sed -i "/${key}/s,:.*,: ${new_value}," "$filename"
+}
+
+function configure() {
+	local dirname="${1}"
+	local order="${2}"
+
+	[ -z "${order}" ] && {
+		echo "No order of the node is set" >&2
+		return 1
+	}
+
+	[ -d "${dirname}" ] || {
+		echo "No '${dirname}' directory exist" >&2
+		return 1
+	}
+
+	local cassandra_yaml="${dirname}/conf/cassandra.yaml" 
+	[ -f "${cassandra_yaml}" ] || {
+		echo "No '${cassandra_yaml}' file exists. Is it a cassandra distribution?" >&2
+		return 1
+	}
+
+	local cassandra_env="${dirname}/conf/cassandra-env.sh" 
+	[ -f "${cassandra_env}" ] || {
+		echo "No '${cassandra_env}' file exists. Is it a cassandra distribution?" >&2
+		return 1
+	}
+
+	local jmx_port=$((27200 + order))
+	sed -i "/^JMX_PORT=/s,=.*,=${jmx_port}," "${cassandra_env}"
+
+	local storage_port=$((17000 + order))
+	local native_transport_port=$((19042 + order))
+
+	change_yaml_value "${cassandra_yaml}" '^storage_port' "${storage_port}"
+	change_yaml_value "${cassandra_yaml}" '^ssl_storage_port' "${storage_port}"
+	change_yaml_value "${cassandra_yaml}" '^native_transport_port' "${native_transport_port}"
+	change_yaml_value "${cassandra_yaml}" '^\s*- seeds: ' '127.0.0.1:17001'
+}
+
+function setup() {
+	local total_nodes="${1}"
+	local node_dir_prefix="${2:-node}"
+
+	local i=0
+	while [ "$i" -lt "${total_nodes}" ]; do
+		i=$((i + 1))
+
+		local node_name="${node_dir_prefix}-${i}"
+
+		extract "${node_name}"
+		configure "${node_name}" "${i}"
+	done
+}
+
+function start_cluster() {
+	local total_nodes="${1}"
+	local node_dir_prefix="${2:-node}"
+
+	local seed_node="${node_dir_prefix}-1"
+	[ -d "${seed_node}" ] || {
+		echo "No '${seed_node}' seed node directory found."
+		return 1
+	}
+
+	nodes_logs=()
+
+	${seed_node}/bin/cassandra >/dev/null
+	echo "Waiting for the seed node to start..."
+	sleep 10
+	nodes+=("${seed_node}/logs/system.log")
+
+	local i=1
+	while [ "$i" -lt "${total_nodes}" ]; do
+		i=$((i + 1))
+
+		local node_name="${node_dir_prefix}-${i}"
+		${node_name}/bin/cassandra >/dev/null
+		sleep 5
+		nodes+=("${node_name}/logs/system.log")
+	done
+
+	echo "Waiting for nodes to start..."
+	sleep 10
+	tail -f ${nodes[*]}
+}
+
+check_exists "${VERSION}" ||
+       	download "${VERSION}" &&
+	setup 3 &&
+	start_cluster 3 &&
+       	echo "Success" || echo "Failure"
