@@ -1,17 +1,20 @@
 #!/bin/bash
 
 VERSION=${1:-4.0.6}
+OUT=${2:-out}
 
 function check_exists() {
 	local version="${1:-${VERSION}}"
-	local dist="${2:-cassandra-${version}.tar.gz}"
+	local dist="${2:-${OUT}/${version}.tar.gz}"
 
 	[ -f "${dist}" ]
 }
 
 function download() {
 	local version="${1:-${VERSION}}"
-	local dist="${2:-cassandra-${version}.tar.gz}"
+	local dist="${2:-${OUT}/${version}.tar.gz}"
+
+	mkdir -p "$(dirname ${dist})"
 
 	local url="https://dlcdn.apache.org/cassandra/${VERSION}/apache-cassandra-${VERSION}-bin.tar.gz"
 
@@ -19,10 +22,10 @@ function download() {
 }
 
 function extract() {
-	local target_dir="${1}"
-	local filename="${2:-cassandra-${VERSION}.tar.gz}"
+	local target_name="${1}"
+	local filename="${2:-${OUT}/${VERSION}.tar.gz}"
 
-	[ -d "${target_dir}" ] && {
+	[ -d "${target_name}" ] && {
 		return 0
 	}
 
@@ -31,8 +34,12 @@ function extract() {
 		return 1
 	}
 
-	# FIXME check tar transform
-	tar -xf "${filename}" --transform "s/apache-cassandra-4.0.6/${target_dir}/"
+	local out=$(dirname ${target_name})
+
+	local new_head_dir=$(basename ${target_name})
+	local head_dir_in_tar='[^/]\+'
+
+	tar -xf "${filename}" --transform "s,${head_dir_in_tar},${new_head_dir}," -C "${out}"
 }
 
 function change_yaml_value() {
@@ -69,13 +76,13 @@ function configure() {
 
 	local cassandra_yaml="${dirname}/conf/cassandra.yaml" 
 	[ -f "${cassandra_yaml}" ] || {
-		echo "No '${cassandra_yaml}' file exists. Is it a cassandra distribution?" >&2
+		echo "No '${cassandra_yaml}' file exists. Is it a Cassandra distribution?" >&2
 		return 1
 	}
 
 	local cassandra_env="${dirname}/conf/cassandra-env.sh" 
 	[ -f "${cassandra_env}" ] || {
-		echo "No '${cassandra_env}' file exists. Is it a cassandra distribution?" >&2
+		echo "No '${cassandra_env}' file exists. Is it a Cassandra distribution?" >&2
 		return 1
 	}
 
@@ -83,7 +90,7 @@ function configure() {
 	sed -i "/^JMX_PORT=/s,=.*,=${jmx_port}," "${cassandra_env}"
 
 	local storage_port=$((17000 + order))
-	local native_transport_port=$((19042 + order))
+	local native_transport_port=$((19040 + order))
 
 	change_yaml_value "${cassandra_yaml}" '^storage_port' "${storage_port}"
 	change_yaml_value "${cassandra_yaml}" '^ssl_storage_port' "${storage_port}"
@@ -93,7 +100,7 @@ function configure() {
 
 function setup() {
 	local total_nodes="${1}"
-	local node_dir_prefix="${2:-node}"
+	local node_dir_prefix="${2:-${OUT}/node}"
 
 	local i=0
 	while [ "$i" -lt "${total_nodes}" ]; do
@@ -106,9 +113,23 @@ function setup() {
 	done
 }
 
+
+function get_log_file() {
+	local node_name="${1}"
+
+
+	local log_dir="${node_name}/logs"
+	mkdir -p "${log_dir}"
+
+	local log_file="${log_dir}/system.log"
+	[ -f "$log_file" ] || touch "${log_file}"
+
+	echo "${log_file}"
+}
+
 function start_cluster() {
 	local total_nodes="${1}"
-	local node_dir_prefix="${2:-node}"
+	local node_dir_prefix="${2:-${OUT}/node}"
 
 	local seed_node="${node_dir_prefix}-1"
 	[ -d "${seed_node}" ] || {
@@ -118,19 +139,26 @@ function start_cluster() {
 
 	nodes_logs=()
 
+	local log_file="$(get_log_file ${seed_node})"
+	nodes+=("${log_file}")
+
 	${seed_node}/bin/cassandra >/dev/null
 	echo "Waiting for the seed node to start..."
 	sleep 10
-	nodes+=("${seed_node}/logs/system.log")
 
+	echo "Starting nodes of the ring"
 	local i=1
 	while [ "$i" -lt "${total_nodes}" ]; do
 		i=$((i + 1))
 
 		local node_name="${node_dir_prefix}-${i}"
+
+		local log_file="$(get_log_file ${node_name})"
+		nodes+=("${log_file}")
+
 		${node_name}/bin/cassandra >/dev/null
-		sleep 5
-		nodes+=("${node_name}/logs/system.log")
+
+		sleep 10
 	done
 
 	echo "Waiting for nodes to start..."
@@ -140,6 +168,6 @@ function start_cluster() {
 
 check_exists "${VERSION}" ||
        	download "${VERSION}" &&
-	setup 3 &&
-	start_cluster 3 &&
+	setup 4 &&
+	start_cluster 4 &&
        	echo "Success" || echo "Failure"
